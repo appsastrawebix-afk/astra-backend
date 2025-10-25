@@ -18,7 +18,9 @@ if not firebase_admin._apps:
     else:
         raise Exception("❌ FIREBASE_KEY environment variable not found. Please set it in Render.")
 
+# ✅ Firestore Client
 db = firestore.client()
+
 
 # 🧩 TEST ROUTE — Backend check (for Android Retrofit)
 @app.route("/api/ping", methods=["GET"])
@@ -28,6 +30,7 @@ def ping():
         "message": "Backend Connected Successfully!",
         "time": datetime.datetime.utcnow().isoformat()
     }), 200
+
 
 # 🧠 SIGNUP ROUTE
 @app.route("/api/signup", methods=["POST"])
@@ -41,6 +44,7 @@ def signup():
         return jsonify({"error": "Email and Password required"}), 400
 
     try:
+        # Firebase Auth - Create user
         user_record = auth.create_user(
             email=email,
             password=password,
@@ -49,6 +53,7 @@ def signup():
 
         uid = user_record.uid
 
+        # Firestore - Save user profile
         db.collection("users").document(uid).set({
             "email": email,
             "displayName": display_name,
@@ -63,6 +68,7 @@ def signup():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # 🔑 LOGIN ROUTE
 @app.route("/api/login", methods=["POST"])
@@ -87,7 +93,8 @@ def login():
     except Exception as e:
         return jsonify({"error": str(e)}), 401
 
-# 🚀 ENTRY POINT
+
+# 🚀 ENTRY POINT (Render Production Mode)
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Render automatically assigns this
+    app.run(host="0.0.0.0", port=port)  # ⚠️ No debug mode in production
