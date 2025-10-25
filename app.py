@@ -3,19 +3,22 @@ import firebase_admin
 from firebase_admin import credentials, auth, firestore
 import datetime
 import os
+import json
 
 # ✅ Initialize Flask
 app = Flask(__name__)
 
-# ✅ Initialize Firebase
-cred_path = "D:/AstraMarketMind/firebase_config/serviceAccountKey.json"
-# तपास की Firebase आधी initialize झालंय का
+# ✅ Initialize Firebase Securely from Environment Variable
 if not firebase_admin._apps:
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred)
+    firebase_key_json = os.environ.get("FIREBASE_KEY")
+    if firebase_key_json:
+        cred_dict = json.loads(firebase_key_json)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+    else:
+        raise Exception("❌ FIREBASE_KEY environment variable not found. Please set it in Render.")
 
 db = firestore.client()
-
 
 # 🧩 TEST ROUTE — Backend check (for Android Retrofit)
 @app.route("/api/ping", methods=["GET"])
@@ -25,7 +28,6 @@ def ping():
         "message": "Backend Connected Successfully!",
         "time": datetime.datetime.utcnow().isoformat()
     }), 200
-
 
 # 🧠 SIGNUP ROUTE
 @app.route("/api/signup", methods=["POST"])
@@ -39,7 +41,6 @@ def signup():
         return jsonify({"error": "Email and Password required"}), 400
 
     try:
-        # Firebase Auth - Create user
         user_record = auth.create_user(
             email=email,
             password=password,
@@ -48,7 +49,6 @@ def signup():
 
         uid = user_record.uid
 
-        # Firestore - Save user profile
         db.collection("users").document(uid).set({
             "email": email,
             "displayName": display_name,
@@ -63,7 +63,6 @@ def signup():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 # 🔑 LOGIN ROUTE
 @app.route("/api/login", methods=["POST"])
@@ -88,8 +87,7 @@ def login():
     except Exception as e:
         return jsonify({"error": str(e)}), 401
 
-
 # 🚀 ENTRY POINT
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render compatibility
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
