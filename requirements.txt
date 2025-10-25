@@ -4,7 +4,7 @@ flask
 requests
 tqdm
 pandas
-google-cloud-firestore==2.16.0
+google-cloud-firestore>=2.19.0
 grpcio==1.64.0
 gunicorn==23.0.0
 Werkzeug==3.0.3
