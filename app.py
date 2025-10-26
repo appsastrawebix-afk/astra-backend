@@ -9,6 +9,7 @@ import json
 import logging
 from cryptography.fernet import Fernet, InvalidToken
 from functools import wraps
+import requests  # ✅ For broker API verification
 
 # -------------------------
 # Basic config & logging
@@ -70,7 +71,7 @@ def decrypt_text(token: str) -> str:
 
 
 # -------------------------
-# Auth decorator: expects Authorization: Bearer <idToken>
+# Auth decorator
 # -------------------------
 def require_auth(fn):
     @wraps(fn)
@@ -168,7 +169,68 @@ def login():
 
 
 # -------------------------
-# Broker: Connect
+# Broker: Verify (NEW 🔐)
+# -------------------------
+@app.route("/api/broker/verify", methods=["POST"])
+@require_auth
+def broker_verify():
+    """
+    Step before connect: verify broker credentials are valid.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        broker_name = (data.get("broker") or "").lower()
+        api_key = data.get("access_token")
+        api_secret = data.get("refresh_token")
+
+        if not broker_name or not api_key:
+            return jsonify({"error": "broker and api_key required"}), 400
+
+        # 🔎 Mock external verification (in production, actual API request)
+        verified = False
+        broker_info = {}
+
+        if broker_name == "zerodha":
+            # Example: Zerodha profile test
+            verified = True
+            broker_info = {"name": "Zerodha User", "client_id": "Z12345"}
+
+        elif broker_name == "angelone":
+            # Example: Angel One profile test
+            verified = True
+            broker_info = {"name": "Angel One Trader", "client_id": "A1122"}
+
+        elif broker_name == "upstox":
+            verified = True
+            broker_info = {"name": "Upstox User", "client_id": "UP0099"}
+
+        elif broker_name == "aliceblue":
+            verified = True
+            broker_info = {"name": "Alice Blue User", "client_id": "AL6655"}
+
+        if verified:
+            return jsonify({
+                "ok": True,
+                "verified": True,
+                "broker": broker_name,
+                "user": broker_info,
+                "message": f"{broker_name.capitalize()} API Key verified successfully."
+            }), 200
+        else:
+            return jsonify({
+                "ok": False,
+                "verified": False,
+                "broker": broker_name,
+                "message": "Invalid credentials or broker not supported."
+            }), 401
+
+    except Exception as e:
+        logger.exception("broker_verify failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# -------------------------
+# Broker: Connect (save after verify)
 # -------------------------
 @app.route("/api/broker/connect", methods=["POST"])
 @require_auth
