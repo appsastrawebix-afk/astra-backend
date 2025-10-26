@@ -9,7 +9,9 @@ import json
 import logging
 from cryptography.fernet import Fernet, InvalidToken
 from functools import wraps
-import requests  # ✅ For broker API verification
+
+# external http requests for broker verification
+import requests
 
 # -------------------------
 # Basic config & logging
@@ -71,7 +73,7 @@ def decrypt_text(token: str) -> str:
 
 
 # -------------------------
-# Auth decorator
+# Auth decorator: expects Authorization: Bearer <idToken>
 # -------------------------
 def require_auth(fn):
     @wraps(fn)
@@ -169,68 +171,116 @@ def login():
 
 
 # -------------------------
-# Broker: Verify (NEW 🔐)
+# Broker: Verify credentials (AngelOne / Upstox / Zerodha)
+# - This does a quick verification step before storing tokens.
+# - Returns ok: true + user info if verification passes.
 # -------------------------
 @app.route("/api/broker/verify", methods=["POST"])
 @require_auth
 def broker_verify():
-    """
-    Step before connect: verify broker credentials are valid.
-    """
     try:
         data = request.get_json(force=True) or {}
-        broker_name = (data.get("broker") or "").lower()
-        api_key = data.get("access_token")
-        api_secret = data.get("refresh_token")
+        broker_name = (data.get("broker") or "").strip().lower()
+        access_token = data.get("access_token")
+        api_key = data.get("api_key") or data.get("access_token')", access_token)  # fallback
+        api_secret = data.get("api_secret") or data.get("refresh_token")
+        meta = data.get("meta", {})
 
-        if not broker_name or not api_key:
-            return jsonify({"error": "broker and api_key required"}), 400
+        if not broker_name or not (access_token or api_key):
+            return jsonify({"ok": False, "error": "broker and access_token/api_key required"}), 400
 
-        # 🔎 Mock external verification (in production, actual API request)
         verified = False
-        broker_info = {}
+        user_info = {}
 
+        # --- Zerodha: simple demo-match rule (adjust to your real Zerodha verification)
         if broker_name == "zerodha":
-            # Example: Zerodha profile test
-            verified = True
-            broker_info = {"name": "Zerodha User", "client_id": "Z12345"}
+            # for demo: if api key startswith demo treat as verified
+            if (api_key or "").startswith("demo") or (access_token or "").startswith("demo"):
+                verified = True
+                user_info = {
+                    "broker": "Zerodha",
+                    "client_id": "ZRD-DEMO-123",
+                    "name": "Zerodha Demo User"
+                }
 
-        elif broker_name == "angelone":
-            # Example: Angel One profile test
-            verified = True
-            broker_info = {"name": "Angel One Trader", "client_id": "A1122"}
+        # --- AngelOne / SmartAPI verification (example)
+        elif broker_name in ("angelone", "angel", "angel broking", "angelbroking"):
+            try:
+                # AngelOne endpoints & headers differ in real; this is an example attempt.
+                # Use actual production/sandbox URLs and header names from AngelOne docs.
+                angel_url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getProfile"
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                resp = requests.get(angel_url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    j = resp.json()
+                    # check shape depending on AngelOne response
+                    # if j contains data or clientcode, treat as verified
+                    if isinstance(j, dict) and (j.get("data") or j.get("clientcode") or j.get("status") == "success"):
+                        # normalize user info if available
+                        data_block = j.get("data") or j
+                        verified = True
+                        user_info = {
+                            "broker": "AngelOne",
+                            "client_id": data_block.get("clientcode", data_block.get("client_id", "ANG-DEMO")),
+                            "name": data_block.get("name", data_block.get("clientName", "Angel Demo"))
+                        }
+                else:
+                    logger.info(f"AngelOne verify returned code {resp.status_code}: {resp.text[:300]}")
+            except Exception as e:
+                logger.warning(f"AngelOne verify request failed: {e}")
 
+        # --- Upstox verification example
         elif broker_name == "upstox":
-            verified = True
-            broker_info = {"name": "Upstox User", "client_id": "UP0099"}
+            try:
+                upstox_url = "https://api.upstox.com/v2/user/profile"
+                headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+                resp = requests.get(upstox_url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    j = resp.json()
+                    # Upstox returns user profile under 'data' commonly
+                    data_block = j.get("data") if isinstance(j, dict) else None
+                    if data_block:
+                        verified = True
+                        user_info = {
+                            "broker": "Upstox",
+                            "client_id": data_block.get("client_id", "UPSTOX-DEMO"),
+                            "name": data_block.get("name", "Upstox Demo")
+                        }
+                else:
+                    logger.info(f"Upstox verify returned code {resp.status_code}: {resp.text[:300]}")
+            except Exception as e:
+                logger.warning(f"Upstox verify request failed: {e}")
 
-        elif broker_name == "aliceblue":
-            verified = True
-            broker_info = {"name": "Alice Blue User", "client_id": "AL6655"}
+        # --- Add other brokers here as needed (AngelOne sandbox vs prod, etc.)
 
         if verified:
             return jsonify({
                 "ok": True,
                 "verified": True,
                 "broker": broker_name,
-                "user": broker_info,
-                "message": f"{broker_name.capitalize()} API Key verified successfully."
+                "user": user_info,
+                "message": f"{broker_name.capitalize()} verified successfully."
             }), 200
         else:
             return jsonify({
                 "ok": False,
                 "verified": False,
                 "broker": broker_name,
-                "message": "Invalid credentials or broker not supported."
+                "message": f"Invalid or unverified credentials for {broker_name}."
             }), 401
 
     except Exception as e:
         logger.exception("broker_verify failed")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # -------------------------
-# Broker: Connect (save after verify)
+# Broker: Connect (store encrypted tokens after verification)
+# POST /api/broker/connect
 # -------------------------
 @app.route("/api/broker/connect", methods=["POST"])
 @require_auth
