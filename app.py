@@ -1,4 +1,7 @@
-# ✅ Astra MarketMind – Production Backend (AngelOne Verified, Error-Free)
+# ✅ Astra MarketMind – 100% Production Backend
+# Brokers Supported: AngelOne (SmartAPI + TOTP), Zerodha, Upstox, Dhan
+# Secure Encrypted Firestore Integration
+
 import os
 import json
 import logging
@@ -144,7 +147,7 @@ def login():
         return jsonify({"ok": False, "error": str(e)}), 401
 
 # -------------------------
-# Save broker tokens
+# Helper: Save broker tokens
 # -------------------------
 def save_broker_tokens(uid: str, broker: str, tokens: dict, meta: dict = None):
     try:
@@ -155,6 +158,9 @@ def save_broker_tokens(uid: str, broker: str, tokens: dict, meta: dict = None):
             enc["refresh_token"] = encrypt_text(tokens["refreshToken"])
         if tokens.get("feedToken"):
             enc["feed_token"] = encrypt_text(tokens["feedToken"])
+        if tokens.get("access_token"):
+            enc["access_token"] = encrypt_text(tokens["access_token"])
+
         broker_doc = {
             **enc,
             "meta": meta or {},
@@ -166,9 +172,10 @@ def save_broker_tokens(uid: str, broker: str, tokens: dict, meta: dict = None):
         logger.exception("❌ Failed to save broker tokens")
 
 # -------------------------
-# AngelOne SmartAPI verified login
+# AngelOne SmartAPI login
 # -------------------------
 SMARTAPI_LOGIN_URL = "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword"
+SMARTAPI_GET_PROFILE = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getProfile"
 
 @app.route("/api/broker/angelone/login_by_password", methods=["POST"])
 @require_auth
@@ -210,15 +217,29 @@ def angelone_login_by_password():
                 "refreshToken": data.get("refreshToken"),
                 "feedToken": data.get("feedToken")
             }
+
             uid = request.user["uid"]
             meta = {"client_code": client_code, "verified_at": datetime.datetime.utcnow().isoformat()}
             save_broker_tokens(uid, "angelone", tokens, meta)
+
+            # Get profile info
+            try:
+                prof_headers = {
+                    "Authorization": f"Bearer {tokens['jwtToken']}",
+                    "X-ClientCode": client_code,
+                    "Accept": "application/json"
+                }
+                profile_resp = requests.get(SMARTAPI_GET_PROFILE, headers=prof_headers, timeout=10)
+                profile_json = profile_resp.json()
+            except Exception as e:
+                profile_json = {"error": str(e)}
+
             return jsonify({
                 "ok": True,
                 "verified": True,
                 "broker": "angelone",
                 "message": "AngelOne SmartAPI verified successfully",
-                "tokens": tokens
+                "profile": profile_json
             }), 200
         else:
             return jsonify({
@@ -230,6 +251,65 @@ def angelone_login_by_password():
     except Exception as e:
         logger.exception("AngelOne SmartAPI verification error")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# -------------------------
+# Broker: Verify (Zerodha, Dhan, Upstox)
+# -------------------------
+@app.route("/api/broker/verify", methods=["POST"])
+@require_auth
+def broker_verify():
+    try:
+        data = request.get_json(force=True)
+        broker = (data.get("broker") or "").lower()
+        uid = request.user["uid"]
+
+        # Zerodha
+        if broker == "zerodha":
+            api_key = data.get("api_key")
+            access_token = data.get("access_token")
+            if not (api_key and access_token):
+                return jsonify({"ok": False, "error": "api_key and access_token required"}), 400
+
+            headers = {"Authorization": f"token {api_key}:{access_token}"}
+            resp = requests.get("https://api.kite.trade/user/profile", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                save_broker_tokens(uid, "zerodha", {"access_token": access_token}, {"verified": True})
+                return jsonify({"ok": True, "broker": "zerodha", "message": "Zerodha verified"}), 200
+            return jsonify({"ok": False, "error": resp.text}), 401
+
+        # Upstox
+        elif broker == "upstox":
+            access_token = data.get("access_token")
+            if not access_token:
+                return jsonify({"ok": False, "error": "access_token required"}), 400
+
+            headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+            resp = requests.get("https://api.upstox.com/v2/user/profile", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                save_broker_tokens(uid, "upstox", {"access_token": access_token}, {"verified": True})
+                return jsonify({"ok": True, "broker": "upstox", "message": "Upstox verified"}), 200
+            return jsonify({"ok": False, "error": resp.text}), 401
+
+        # Dhan
+        elif broker == "dhan":
+            access_token = data.get("access_token")
+            if not access_token:
+                return jsonify({"ok": False, "error": "access_token required"}), 400
+
+            headers = {"Authorization": f"Bearer {access_token}"}
+            resp = requests.get("https://api.dhan.co/accounts/details", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                save_broker_tokens(uid, "dhan", {"access_token": access_token}, {"verified": True})
+                return jsonify({"ok": True, "broker": "dhan", "message": "Dhan verified"}), 200
+            return jsonify({"ok": False, "error": resp.text}), 401
+
+        else:
+            return jsonify({"ok": False, "error": f"Unsupported broker: {broker}"}), 400
+    except Exception as e:
+        logger.exception("Broker verify failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # -------------------------
 # Broker list / disconnect
@@ -268,6 +348,7 @@ def broker_disconnect():
     except Exception as e:
         logger.exception("Broker disconnect failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # -------------------------
 # Run server
