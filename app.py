@@ -325,6 +325,105 @@ def broker_list():
     safe = {k: {"meta": v.get("meta"), "connected_at": v.get("connected_at")} for k, v in brokers.items()}
     return jsonify({"ok": True, "brokers": safe}), 200
 
+# -------------------------
+# User Trading Accounts (Paper + Real)
+# -------------------------
+
+@app.route("/api/user/add_trading_account", methods=["POST"])
+@require_auth
+def add_trading_account():
+    try:
+        data = request.get_json(force=True)
+        uid = request.user["uid"]
+        mode = data.get("mode", "real")  # paper or real
+
+        if mode not in ["paper", "real"]:
+            return jsonify({"ok": False, "error": "mode must be 'paper' or 'real'"}), 400
+
+        if mode == "real":
+            broker_name = data.get("broker_name")
+            api_key = data.get("api_key")
+            client_id = data.get("client_id")
+            access_token = data.get("access_token")
+            if not all([broker_name, api_key, client_id, access_token]):
+                return jsonify({"ok": False, "error": "Missing broker_name, api_key, client_id or access_token"}), 400
+
+            account_data = {
+                "broker_name": broker_name,
+                "api_key": encrypt_text(api_key),
+                "client_id": client_id,
+                "access_token": encrypt_text(access_token),
+                "margin_balance": data.get("margin_balance", 0),
+                "positions": [],
+                "last_updated": datetime.datetime.utcnow().isoformat()
+            }
+
+        else:  # Paper Trading
+            account_data = {
+                "broker_name": "virtual",
+                "balance": data.get("balance", 100000),
+                "positions": [],
+                "last_updated": datetime.datetime.utcnow().isoformat()
+            }
+
+        db.collection("users").document(uid).set(
+            {"trading_accounts": {mode: account_data}}, merge=True
+        )
+
+        return jsonify({"ok": True, "message": f"{mode.capitalize()} trading account added successfully!"}), 200
+
+    except Exception as e:
+        logger.exception("Add trading account failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/user/get_trading_account", methods=["POST"])
+@require_auth
+def get_trading_account():
+    try:
+        data = request.get_json(force=True)
+        uid = request.user["uid"]
+        mode = data.get("mode", "real")
+
+        doc = db.collection("users").document(uid).get()
+        if not doc.exists:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+
+        user_data = doc.to_dict()
+        accounts = user_data.get("trading_accounts", {})
+        acc = accounts.get(mode)
+
+        if not acc:
+            return jsonify({"ok": False, "error": f"No {mode} account found"}), 404
+
+        # Decrypt real trading API keys before sending
+        if mode == "real":
+            acc["api_key"] = decrypt_text(acc.get("api_key", ""))
+            acc["access_token"] = decrypt_text(acc.get("access_token", ""))
+
+        return jsonify({"ok": True, "mode": mode, "account": acc}), 200
+    except Exception as e:
+        logger.exception("Get trading account failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/user/switch_mode", methods=["POST"])
+@require_auth
+def switch_mode():
+    try:
+        uid = request.user["uid"]
+        data = request.get_json(force=True)
+        new_mode = data.get("mode")
+
+        if new_mode not in ["paper", "real"]:
+            return jsonify({"ok": False, "error": "Invalid mode"}), 400
+
+        db.collection("users").document(uid).set({"mode": new_mode}, merge=True)
+        return jsonify({"ok": True, "message": f"Mode switched to {new_mode}"}), 200
+    except Exception as e:
+        logger.exception("Switch mode failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/api/broker/disconnect", methods=["POST"])
 @require_auth
