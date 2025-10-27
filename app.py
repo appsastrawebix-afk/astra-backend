@@ -9,8 +9,6 @@ import json
 import logging
 from cryptography.fernet import Fernet, InvalidToken
 from functools import wraps
-
-# external http requests for broker verification
 import requests
 
 # -------------------------
@@ -171,9 +169,202 @@ def login():
 
 
 # -------------------------
-# Broker: Verify credentials (AngelOne / Upstox / Zerodha)
-# - This does a quick verification step before storing tokens.
-# - Returns ok: true + user info if verification passes.
+# Broker helper utilities & endpoints
+# -------------------------
+SMARTAPI_BASE = "https://apiconnect.angelbroking.com"
+SMARTAPI_LOGIN_BY_PASSWORD = SMARTAPI_BASE + "/rest/auth/angelbroking/user/v1/loginByPassword"
+SMARTAPI_GET_PROFILE = SMARTAPI_BASE + "/rest/secure/angelbroking/user/v1/getProfile"
+# SMARTAPI_REFRESH left as placeholder; implement per current SmartAPI docs when needed
+
+ZERODHA_API_BASE = "https://api.kite.trade"
+DHAN_API_BASE = "https://api.dhan.co"  # confirm exact base with Dhan docs
+UPSTOX_API_BASE = "https://api.upstox.com/v2"
+
+
+def _safe_get_meta(meta, key):
+    try:
+        if isinstance(meta, dict):
+            return meta.get(key)
+    except Exception:
+        pass
+    return None
+
+
+def save_broker_tokens_to_firestore(uid: str, broker_name: str, tokens: dict, meta: dict = None):
+    """
+    Encrypt tokens using fernet and store into Firestore under users/{uid}.brokers.{broker_name}
+    tokens is a dict that may contain keys like jwtToken, refreshToken, feedToken, access_token
+    """
+    enc = {}
+    try:
+        if tokens.get("jwtToken"):
+            enc["access_token"] = encrypt_text(tokens.get("jwtToken"))
+        elif tokens.get("access_token"):
+            enc["access_token"] = encrypt_text(tokens.get("access_token"))
+        else:
+            enc["access_token"] = encrypt_text(tokens.get("token") or "")
+
+        if tokens.get("refreshToken"):
+            enc["refresh_token"] = encrypt_text(tokens.get("refreshToken"))
+        elif tokens.get("refresh_token"):
+            enc["refresh_token"] = encrypt_text(tokens.get("refresh_token"))
+
+        if tokens.get("feedToken"):
+            enc["feed_token"] = encrypt_text(tokens.get("feedToken"))
+
+    except Exception as e:
+        logger.exception("Failed to encrypt tokens: %s", e)
+        # continue and save whatever we have
+
+    broker_doc = {
+        **enc,
+        "meta": meta or {},
+        "connected_at": datetime.datetime.utcnow().isoformat()
+    }
+    user_ref = db.collection("users").document(uid)
+    user_ref.set({"brokers": {broker_name: broker_doc}}, merge=True)
+    logger.info("Saved encrypted tokens for user %s broker %s", uid, broker_name)
+
+
+# -------------------------
+# Broker verification functions
+# -------------------------
+def smartapi_login(api_key: str, client_code: str, mpin_or_password: str, totp: str = None,
+                   client_local_ip: str = None, client_public_ip: str = None, mac_address: str = None):
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-PrivateKey": api_key,
+        "X-UserType": "USER",
+        "X-SourceID": "WEB"
+    }
+    if client_local_ip:
+        headers["X-ClientLocalIP"] = client_local_ip
+    if client_public_ip:
+        headers["X-ClientPublicIP"] = client_public_ip
+    if mac_address:
+        headers["X-MACAddress"] = mac_address
+
+    payload = {
+        "clientcode": client_code,
+        "password": mpin_or_password
+    }
+    if totp:
+        payload["totp"] = totp
+
+    try:
+        resp = requests.post(SMARTAPI_LOGIN_BY_PASSWORD, json=payload, headers=headers, timeout=15)
+    except Exception as e:
+        raise Exception(f"SmartAPI login request failed: {e}")
+
+    try:
+        j = resp.json()
+    except Exception:
+        raise Exception(f"SmartAPI login: invalid JSON response ({resp.status_code}) - {resp.text[:300]}")
+
+    # SmartAPI success shape typically: {"status": True, "message": "...", "data": {...}}
+    if resp.status_code in (200, 201) and (j.get("status") is True or j.get("data")):
+        data = j.get("data") or j
+        tokens = {
+            "jwtToken": data.get("jwtToken") or data.get("data", {}).get("jwtToken"),
+            "refreshToken": data.get("refreshToken") or data.get("data", {}).get("refreshToken"),
+            "feedToken": data.get("feedToken") or data.get("data", {}).get("feedToken"),
+        }
+        return {"raw": j, "tokens": tokens, "data": data}
+    else:
+        msg = j.get("message") if isinstance(j, dict) else str(j)
+        raise Exception(f"SmartAPI login failed ({resp.status_code}): {msg}")
+
+
+def smartapi_get_profile(jwt_token: str, client_code: str):
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Accept": "application/json",
+        "X-SourceID": "WEB",
+        "X-ClientCode": client_code
+    }
+    try:
+        resp = requests.get(SMARTAPI_GET_PROFILE, headers=headers, timeout=10)
+    except Exception as e:
+        raise Exception(f"SmartAPI getProfile request failed: {e}")
+
+    try:
+        j = resp.json()
+    except Exception:
+        raise Exception(f"SmartAPI getProfile: invalid JSON ({resp.status_code}) - {resp.text[:300]}")
+
+    if resp.status_code == 200 and (j.get("status") is True or j.get("data") or j.get("clientcode")):
+        return j
+    else:
+        msg = j.get("message") if isinstance(j, dict) else str(j)
+        raise Exception(f"SmartAPI getProfile failed ({resp.status_code}): {msg}")
+
+
+def verify_zerodha(api_key: str, access_token: str):
+    """
+    Verify Zerodha Kite connection by calling user profile.
+    Kite Connect expects Authorization header as: token <api_key>:<access_token>
+    """
+    headers = {"Authorization": f"token {api_key}:{access_token}"}
+    try:
+        resp = requests.get(f"{ZERODHA_API_BASE}/user/profile", headers=headers, timeout=10)
+    except Exception as e:
+        raise Exception(f"Zerodha verify request failed: {e}")
+
+    if resp.status_code == 200:
+        try:
+            j = resp.json()
+        except Exception:
+            raise Exception("Zerodha returned invalid JSON")
+        return {"ok": True, "profile": j}
+    else:
+        raise Exception(f"Zerodha verify failed ({resp.status_code}): {resp.text[:300]}")
+
+
+def verify_dhan(access_token: str):
+    """
+    Verify Dhan account. Endpoint may vary depending on Dhan's API version.
+    Adjust endpoint to exact Dhan Connect endpoint.
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    candidates = [
+        f"{DHAN_API_BASE}/v1/accounts/details",
+        f"{DHAN_API_BASE}/accounts/details",
+        f"{DHAN_API_BASE}/v1/user/profile",
+        f"{DHAN_API_BASE}/user/profile"
+    ]
+    for url in candidates:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code == 200:
+            try:
+                return {"ok": True, "profile": resp.json()}
+            except Exception:
+                return {"ok": True, "profile": {"raw": resp.text}}
+    raise Exception("Dhan verify failed: no valid profile endpoint response (check Dhan API base/paths and token).")
+
+
+def verify_upstox(access_token: str):
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    try:
+        resp = requests.get(f"{UPSTOX_API_BASE}/user/profile", headers=headers, timeout=10)
+    except Exception as e:
+        raise Exception(f"Upstox verify request failed: {e}")
+
+    if resp.status_code == 200:
+        try:
+            j = resp.json()
+        except Exception:
+            raise Exception("Upstox returned invalid JSON")
+        return {"ok": True, "profile": j}
+    else:
+        raise Exception(f"Upstox verify failed ({resp.status_code}): {resp.text[:300]}")
+
+
+# -------------------------
+# Broker: Verify credentials (multi-broker)
 # -------------------------
 @app.route("/api/broker/verify", methods=["POST"])
 @require_auth
@@ -182,80 +373,123 @@ def broker_verify():
         data = request.get_json(force=True) or {}
         broker_name = (data.get("broker") or "").strip().lower()
         access_token = data.get("access_token")
-        api_key = data.get("api_key") or data.get("access_token')", access_token)  # fallback
+        api_key = data.get("api_key") or access_token
         api_secret = data.get("api_secret") or data.get("refresh_token")
-        meta = data.get("meta", {})
+        meta = data.get("meta", {}) or {}
 
-        if not broker_name or not (access_token or api_key):
-            return jsonify({"ok": False, "error": "broker and access_token/api_key required"}), 400
+        if not broker_name:
+            return jsonify({"ok": False, "error": "broker is required"}), 400
 
         verified = False
         user_info = {}
 
-        # --- Zerodha: simple demo-match rule (adjust to your real Zerodha verification)
-        if broker_name == "zerodha":
-            # for demo: if api key startswith demo treat as verified
-            if (api_key or "").startswith("demo") or (access_token or "").startswith("demo"):
+        # ---------------- ANGELONE ----------------
+        if broker_name in ("angelone", "angel", "angel broking", "angelbroking"):
+            api_key_local = data.get("api_key") or data.get("private_key") or api_key
+            client_code = data.get("client_code") or data.get("clientid") or data.get("client_id")
+            mpin = data.get("mpin") or data.get("password") or data.get("mpin_password")
+            totp = data.get("totp") or None
+
+            if not api_key_local or not client_code or not mpin:
+                return jsonify({"ok": False, "verified": False, "message": "api_key, client_code and mpin/password required for AngelOne"}), 400
+
+            try:
+                client_local_ip = _safe_get_meta(meta, "client_local_ip") or data.get("client_local_ip")
+                client_public_ip = _safe_get_meta(meta, "client_public_ip") or data.get("client_public_ip")
+                mac_address = _safe_get_meta(meta, "mac_address") or data.get("mac_address")
+
+                login_res = smartapi_login(
+                    api_key=api_key_local,
+                    client_code=client_code,
+                    mpin_or_password=mpin,
+                    totp=totp,
+                    client_local_ip=client_local_ip,
+                    client_public_ip=client_public_ip,
+                    mac_address=mac_address
+                )
+                tokens = login_res.get("tokens", {})
+                profile = {}
+                try:
+                    if tokens.get("jwtToken"):
+                        profile = smartapi_get_profile(tokens.get("jwtToken"), client_code)
+                except Exception as e_profile:
+                    logger.warning("AngelOne profile fetch failed after login: %s", e_profile)
+
+                uid = request.user["uid"]
+                save_broker_tokens_to_firestore(uid, "angelone", tokens, meta)
+
+                verified = True
+                user_info = {
+                    "broker": "AngelOne",
+                    "client_id": client_code,
+                    "profile": profile
+                }
+            except Exception as e:
+                logger.warning("AngelOne verify failed: %s", e)
+                return jsonify({"ok": False, "verified": False, "broker": "angelone", "message": str(e)}), 401
+
+        # ---------------- ZERODHA ----------------
+        elif broker_name == "zerodha":
+            api_key_local = data.get("api_key")
+            access_token_local = data.get("access_token") or data.get("token") or api_secret
+
+            if not api_key_local or not access_token_local:
+                return jsonify({"ok": False, "verified": False, "message": "api_key and access_token required for Zerodha"}), 400
+
+            try:
+                result = verify_zerodha(api_key_local, access_token_local)
+                uid = request.user["uid"]
+                save_broker_tokens_to_firestore(uid, "zerodha", {"access_token": access_token_local}, meta)
                 verified = True
                 user_info = {
                     "broker": "Zerodha",
-                    "client_id": "ZRD-DEMO-123",
-                    "name": "Zerodha Demo User"
+                    "client_id": (result.get("profile", {}).get("data", {}) or {}).get("user_id") or result.get("profile", {}).get("user_id"),
+                    "profile": result.get("profile")
                 }
-
-        # --- AngelOne / SmartAPI verification (example)
-        elif broker_name in ("angelone", "angel", "angel broking", "angelbroking"):
-            try:
-                # AngelOne endpoints & headers differ in real; this is an example attempt.
-                # Use actual production/sandbox URLs and header names from AngelOne docs.
-                angel_url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getProfile"
-                headers = {
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                }
-                resp = requests.get(angel_url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    j = resp.json()
-                    # check shape depending on AngelOne response
-                    # if j contains data or clientcode, treat as verified
-                    if isinstance(j, dict) and (j.get("data") or j.get("clientcode") or j.get("status") == "success"):
-                        # normalize user info if available
-                        data_block = j.get("data") or j
-                        verified = True
-                        user_info = {
-                            "broker": "AngelOne",
-                            "client_id": data_block.get("clientcode", data_block.get("client_id", "ANG-DEMO")),
-                            "name": data_block.get("name", data_block.get("clientName", "Angel Demo"))
-                        }
-                else:
-                    logger.info(f"AngelOne verify returned code {resp.status_code}: {resp.text[:300]}")
             except Exception as e:
-                logger.warning(f"AngelOne verify request failed: {e}")
+                logger.warning("Zerodha verify failed: %s", e)
+                return jsonify({"ok": False, "verified": False, "broker": "zerodha", "message": str(e)}), 401
 
-        # --- Upstox verification example
+        # ---------------- DHAN ----------------
+        elif broker_name == "dhan":
+            access_token_local = data.get("access_token") or data.get("api_key") or api_secret
+            if not access_token_local:
+                return jsonify({"ok": False, "verified": False, "message": "access_token required for Dhan"}), 400
+            try:
+                result = verify_dhan(access_token_local)
+                uid = request.user["uid"]
+                save_broker_tokens_to_firestore(uid, "dhan", {"access_token": access_token_local}, meta)
+                verified = True
+                user_info = {
+                    "broker": "Dhan",
+                    "client_id": result.get("profile", {}).get("clientId") or result.get("profile", {}).get("id"),
+                    "profile": result.get("profile")
+                }
+            except Exception as e:
+                logger.warning("Dhan verify failed: %s", e)
+                return jsonify({"ok": False, "verified": False, "broker": "dhan", "message": str(e)}), 401
+
+        # ---------------- UPSTOX ----------------
         elif broker_name == "upstox":
+            access_token_local = data.get("access_token") or data.get("token") or api_secret
+            if not access_token_local:
+                return jsonify({"ok": False, "verified": False, "message": "access_token required for Upstox"}), 400
             try:
-                upstox_url = "https://api.upstox.com/v2/user/profile"
-                headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-                resp = requests.get(upstox_url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    j = resp.json()
-                    # Upstox returns user profile under 'data' commonly
-                    data_block = j.get("data") if isinstance(j, dict) else None
-                    if data_block:
-                        verified = True
-                        user_info = {
-                            "broker": "Upstox",
-                            "client_id": data_block.get("client_id", "UPSTOX-DEMO"),
-                            "name": data_block.get("name", "Upstox Demo")
-                        }
-                else:
-                    logger.info(f"Upstox verify returned code {resp.status_code}: {resp.text[:300]}")
+                result = verify_upstox(access_token_local)
+                uid = request.user["uid"]
+                save_broker_tokens_to_firestore(uid, "upstox", {"access_token": access_token_local}, meta)
+                verified = True
+                user_info = {
+                    "broker": "Upstox",
+                    "client_id": (result.get("profile", {}).get("data", {}) or {}).get("client_id") or result.get("profile", {}).get("client_id"),
+                    "profile": result.get("profile")
+                }
             except Exception as e:
-                logger.warning(f"Upstox verify request failed: {e}")
+                logger.warning("Upstox verify failed: %s", e)
+                return jsonify({"ok": False, "verified": False, "broker": "upstox", "message": str(e)}), 401
 
-        # --- Add other brokers here as needed (AngelOne sandbox vs prod, etc.)
+        else:
+            return jsonify({"ok": False, "verified": False, "message": f"Unsupported broker: {broker_name}"}), 400
 
         if verified:
             return jsonify({
@@ -290,7 +524,7 @@ def broker_connect():
         broker_name = data.get("broker")
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
-        meta = data.get("meta", {})
+        meta = data.get("meta", {}) or {}
 
         if not broker_name or not access_token:
             return jsonify({"error": "broker and access_token required"}), 400
