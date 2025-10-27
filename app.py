@@ -52,6 +52,7 @@ except Exception as e:
 # Fernet setup
 # -------------------------
 try:
+    # FERNET_KEY is expected to be a base64 urlsafe key string
     fernet = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 except Exception:
     logger.exception("❌ Invalid FERNET_KEY")
@@ -115,7 +116,8 @@ def signup():
             "email": email,
             "displayName": display_name,
             "createdAt": firestore.SERVER_TIMESTAMP,
-            "brokers": {}
+            "brokers": {},
+            "trading_accounts": {}
         })
         return jsonify({"ok": True, "uid": user.uid, "message": "User created"}), 201
     except Exception as e:
@@ -152,6 +154,7 @@ def login():
 def save_broker_tokens(uid: str, broker: str, tokens: dict, meta: dict = None):
     try:
         enc = {}
+        # prefer token names from SmartAPI and generic providers
         if tokens.get("jwtToken"):
             enc["access_token"] = encrypt_text(tokens["jwtToken"])
         if tokens.get("refreshToken"):
@@ -160,6 +163,8 @@ def save_broker_tokens(uid: str, broker: str, tokens: dict, meta: dict = None):
             enc["feed_token"] = encrypt_text(tokens["feedToken"])
         if tokens.get("access_token"):
             enc["access_token"] = encrypt_text(tokens["access_token"])
+        if tokens.get("refresh_token"):
+            enc["refresh_token"] = encrypt_text(tokens["refresh_token"])
 
         broker_doc = {
             **enc,
@@ -181,7 +186,17 @@ SMARTAPI_GET_PROFILE = "https://apiconnect.angelbroking.com/rest/secure/angelbro
 @require_auth
 def angelone_login_by_password():
     try:
-        body = request.get_json(force=True)
+        # safe parse
+        try:
+            body = request.get_json(force=True)
+        except Exception:
+            raw = request.data.decode("utf-8", errors="ignore")
+            try:
+                body = json.loads(raw)
+            except Exception as e:
+                logger.exception("Invalid JSON for angelone login")
+                return jsonify({"ok": False, "error": "Invalid JSON", "detail": str(e)}), 400
+
         api_key = body.get("api_key") or ANGEL_API_KEY
         client_code = body.get("client_code")
         mpin = body.get("mpin") or body.get("password")
@@ -202,13 +217,19 @@ def angelone_login_by_password():
             payload["totp"] = totp
 
         logger.info(f"📡 SmartAPI request for client {client_code}")
-        resp = requests.post(SMARTAPI_LOGIN_URL, json=payload, headers=headers, timeout=15)
+        try:
+            resp = requests.post(SMARTAPI_LOGIN_URL, json=payload, headers=headers, timeout=15)
+        except Exception as e:
+            logger.exception("SmartAPI request failed")
+            return jsonify({"ok": False, "error": "SmartAPI request failed", "detail": str(e)}), 502
+
         logger.info(f"🔁 Response {resp.status_code} : {resp.text[:400]}")
 
         try:
             j = resp.json()
         except Exception:
-            return jsonify({"ok": False, "error": "Invalid JSON from SmartAPI"}), 502
+            # return raw for debugging
+            return jsonify({"ok": False, "error": "Invalid JSON from SmartAPI", "raw": resp.text[:400]}), 502
 
         if resp.status_code in (200, 201) and j.get("status") is True:
             data = j.get("data", {})
@@ -223,14 +244,15 @@ def angelone_login_by_password():
             save_broker_tokens(uid, "angelone", tokens, meta)
 
             # Get profile info
+            profile_json = {}
             try:
                 prof_headers = {
-                    "Authorization": f"Bearer {tokens['jwtToken']}",
+                    "Authorization": f"Bearer {tokens.get('jwtToken')}",
                     "X-ClientCode": client_code,
                     "Accept": "application/json"
                 }
                 profile_resp = requests.get(SMARTAPI_GET_PROFILE, headers=prof_headers, timeout=10)
-                profile_json = profile_resp.json()
+                profile_json = profile_resp.json() if profile_resp.status_code == 200 else {"error": profile_resp.text}
             except Exception as e:
                 profile_json = {"error": str(e)}
 
@@ -326,16 +348,22 @@ def broker_list():
     return jsonify({"ok": True, "brokers": safe}), 200
 
 # -------------------------
-# User Trading Accounts (Paper + Real)
+# Add Trading Account (fixed JSON parse)
 # -------------------------
-
 @app.route("/api/user/add_trading_account", methods=["POST"])
 @require_auth
 def add_trading_account():
     try:
-        data = request.get_json(force=True)
+        # Safe JSON parse (handles PowerShell/curl/JS)
+        try:
+            raw_data = request.data.decode("utf-8")
+            data = json.loads(raw_data) if raw_data else request.get_json(force=True)
+        except Exception as e:
+            logger.exception("❌ JSON parse failed")
+            return jsonify({"ok": False, "error": f"Invalid JSON: {str(e)}"}), 400
+
         uid = request.user["uid"]
-        mode = data.get("mode", "real")  # paper or real
+        mode = data.get("mode", "real")
 
         if mode not in ["paper", "real"]:
             return jsonify({"ok": False, "error": "mode must be 'paper' or 'real'"}), 400
@@ -344,9 +372,9 @@ def add_trading_account():
             broker_name = data.get("broker_name")
             api_key = data.get("api_key")
             client_id = data.get("client_id")
-            access_token = data.get("access_token")
-            if not all([broker_name, api_key, client_id, access_token]):
-                return jsonify({"ok": False, "error": "Missing broker_name, api_key, client_id or access_token"}), 400
+            access_token = data.get("access_token", "")
+            if not all([broker_name, api_key, client_id]):
+                return jsonify({"ok": False, "error": "Missing broker_name, api_key, or client_id"}), 400
 
             account_data = {
                 "broker_name": broker_name,
@@ -357,8 +385,7 @@ def add_trading_account():
                 "positions": [],
                 "last_updated": datetime.datetime.utcnow().isoformat()
             }
-
-        else:  # Paper Trading
+        else:
             account_data = {
                 "broker_name": "virtual",
                 "balance": data.get("balance", 100000),
@@ -370,6 +397,7 @@ def add_trading_account():
             {"trading_accounts": {mode: account_data}}, merge=True
         )
 
+        logger.info(f"✅ Trading account ({mode}) added for {uid}")
         return jsonify({"ok": True, "message": f"{mode.capitalize()} trading account added successfully!"}), 200
 
     except Exception as e:
@@ -406,18 +434,18 @@ def get_trading_account():
         logger.exception("Get trading account failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------------------------
+# Broker list / disconnect / switch
+# -------------------------
 @app.route("/api/user/switch_mode", methods=["POST"])
 @require_auth
 def switch_mode():
     try:
-        uid = request.user["uid"]
         data = request.get_json(force=True)
         new_mode = data.get("mode")
-
         if new_mode not in ["paper", "real"]:
             return jsonify({"ok": False, "error": "Invalid mode"}), 400
-
+        uid = request.user["uid"]
         db.collection("users").document(uid).set({"mode": new_mode}, merge=True)
         return jsonify({"ok": True, "message": f"Mode switched to {new_mode}"}), 200
     except Exception as e:
@@ -434,20 +462,19 @@ def broker_disconnect():
         if not broker:
             return jsonify({"ok": False, "error": "broker required"}), 400
         uid = request.user["uid"]
-        user_ref = db.collection("users").document(uid)
-        doc = user_ref.get()
+        ref = db.collection("users").document(uid)
+        doc = ref.get()
         if not doc.exists:
             return jsonify({"ok": False, "error": "User not found"}), 404
         brokers = doc.to_dict().get("brokers", {})
         if broker.lower() in brokers:
             brokers.pop(broker.lower())
-            user_ref.set({"brokers": brokers}, merge=True)
+            ref.set({"brokers": brokers}, merge=True)
             return jsonify({"ok": True, "message": f"{broker} disconnected"}), 200
         return jsonify({"ok": False, "error": "Broker not connected"}), 404
     except Exception as e:
         logger.exception("Broker disconnect failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # -------------------------
 # Run server
