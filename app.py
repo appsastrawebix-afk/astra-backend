@@ -1,6 +1,5 @@
-# ✅ Astra MarketMind – 100% Production Backend (Realtime DB only)
-# Brokers Supported: AngelOne (SmartAPI + TOTP), Zerodha, Upstox, Dhan
-# Secure Encrypted Firebase Realtime Database Integration + AngelOne Profile Sync
+# app.py — Astra MarketMind (Realtime DB primary)
+# Realtime DB only, encrypted tokens in RTDB, AngelOne + Zerodha/Upstox/Dhan helpers
 
 import os
 import json
@@ -12,7 +11,13 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, auth, db
+from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
+
+# -------------------------
+# Load environment
+# -------------------------
+load_dotenv()
 
 # -------------------------
 # Basic config
@@ -26,22 +31,46 @@ CORS(app)
 # -------------------------
 # Environment variables
 # -------------------------
-FIREBASE_KEY = os.environ.get("FIREBASE_KEY")
-FERNET_KEY = os.environ.get("FERNET_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ANGEL_API_KEY = os.environ.get("ANGEL_API_KEY", "").strip()
+# Prefer a path to the service account JSON file (recommended)
+FIREBASE_CRED_PATH = os.getenv("FIREBASE_CRED_PATH", "").strip()
 
-if not FIREBASE_KEY or not FERNET_KEY or not DATABASE_URL:
-    raise Exception("❌ FIREBASE_KEY, FERNET_KEY, and DATABASE_URL are required")
+# Alternative: a JSON string stored directly in env (less recommended on Windows)
+FIREBASE_KEY = os.getenv("FIREBASE_KEY")
+
+FERNET_KEY = os.getenv("FERNET_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "").strip()
+
+# Validate required
+if not (FERNET_KEY and DATABASE_URL):
+    raise Exception("❌ FERNET_KEY and DATABASE_URL must be set in environment")
 
 # -------------------------
-# Firebase (Realtime DB only)
+# Firebase initialization (Robust: supports path OR JSON string)
 # -------------------------
 try:
-    firebase_dict = json.loads(FIREBASE_KEY)
-    cred = credentials.Certificate(firebase_dict)
+    cred = None
+    # If path given and file exists -> use it
+    if FIREBASE_CRED_PATH:
+        if not os.path.exists(FIREBASE_CRED_PATH):
+            raise FileNotFoundError(f"Firebase credential file not found at: {FIREBASE_CRED_PATH}")
+        cred = credentials.Certificate(FIREBASE_CRED_PATH)
+        logger.info("Using Firebase credentials from path: %s", FIREBASE_CRED_PATH)
+    # Else if FIREBASE_KEY JSON string present -> try parse
+    elif FIREBASE_KEY:
+        try:
+            firebase_dict = json.loads(FIREBASE_KEY)
+            cred = credentials.Certificate(firebase_dict)
+            logger.info("Using Firebase credentials from FIREBASE_KEY JSON string")
+        except Exception as ex:
+            logger.exception("Failed to parse FIREBASE_KEY JSON. Prefer using FIREBASE_CRED_PATH.")
+            raise
+    else:
+        raise Exception("❌ Provide FIREBASE_CRED_PATH or FIREBASE_KEY in env")
+
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+
     logger.info("✅ Firebase Realtime Database initialized successfully.")
 except Exception as e:
     logger.exception("❌ Firebase initialization failed")
@@ -50,7 +79,12 @@ except Exception as e:
 # -------------------------
 # Fernet setup
 # -------------------------
-fernet = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+try:
+    # FERNET_KEY should be base64 urlsafe key (string)
+    fernet = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+except Exception as e:
+    logger.exception("❌ Invalid FERNET_KEY")
+    raise
 
 def encrypt_text(plain: str) -> str:
     return fernet.encrypt(plain.encode()).decode() if plain else ""
@@ -78,7 +112,7 @@ def require_auth(fn):
             return fn(*args, **kwargs)
         except Exception as e:
             logger.exception("Token verification failed")
-            return jsonify({"ok": False, "error": "Invalid Firebase ID token"}), 401
+            return jsonify({"ok": False, "error": "Invalid Firebase ID token", "detail": str(e)}), 401
     return wrapper
 
 # -------------------------
@@ -86,7 +120,11 @@ def require_auth(fn):
 # -------------------------
 @app.route("/api/ping", methods=["GET"])
 def ping():
-    return jsonify({"ok": True, "message": "Backend Connected Successfully!", "time": datetime.datetime.utcnow().isoformat()}), 200
+    return jsonify({
+        "ok": True,
+        "message": "Backend Connected Successfully!",
+        "time": datetime.datetime.utcnow().isoformat()
+    }), 200
 
 # -------------------------
 # Signup & Login
@@ -95,7 +133,8 @@ def ping():
 def signup():
     try:
         data = request.get_json(force=True)
-        email, password = data.get("email"), data.get("password")
+        email = data.get("email")
+        password = data.get("password")
         name = data.get("displayName", "")
         if not email or not password:
             return jsonify({"ok": False, "error": "Email & password required"}), 400
@@ -110,11 +149,11 @@ def signup():
             "brokerAccounts": {},
             "brokers": {}
         })
+        logger.info(f"✅ User created successfully: {email}")
         return jsonify({"ok": True, "uid": user.uid, "message": "User created"}), 201
     except Exception as e:
         logger.exception("Signup failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -126,6 +165,7 @@ def login():
         decoded = auth.verify_id_token(id_token)
         uid = decoded.get("uid")
         db.reference(f"Users/{uid}/lastLogin").set(datetime.datetime.utcnow().timestamp())
+        logger.info(f"✅ Login success: {decoded.get('email')}")
         return jsonify({"ok": True, "uid": uid, "email": decoded.get("email"), "message": "Login successful"}), 200
     except Exception as e:
         logger.exception("Login failed")
@@ -161,10 +201,14 @@ def angelone_login_by_password():
         if totp:
             payload["totp"] = totp
 
-        resp = requests.post(SMARTAPI_LOGIN_URL, json=payload, headers=headers, timeout=15)
-        data = resp.json()
-        if not data.get("status"):
-            return jsonify({"ok": False, "error": data.get("message", "Login failed")}), 401
+        resp = requests.post(SMARTAPI_LOGIN_URL, json=payload, headers=headers, timeout=20)
+        try:
+            data = resp.json()
+        except Exception:
+            return jsonify({"ok": False, "error": "Invalid JSON from SmartAPI", "status": resp.status_code, "raw": resp.text[:400]}), 502
+
+        if not (resp.status_code in (200,201) and data.get("status") in (True, "true", "TRUE")):
+            return jsonify({"ok": False, "error": data.get("message", "SmartAPI login failed"), "response": data}), 401
 
         tokens = data.get("data", {})
         uid = request.user["uid"]
@@ -181,20 +225,21 @@ def angelone_login_by_password():
         }
         db.reference(f"Users/{uid}/brokers/angelone").set(broker_info)
 
-        # Fetch and store profile info
+        # Fetch profile (best-effort)
         prof_headers = {
             "Authorization": f"Bearer {tokens.get('jwtToken')}",
             "X-ClientCode": client_code,
             "Accept": "application/json"
         }
-        profile = requests.get(SMARTAPI_PROFILE_URL, headers=prof_headers, timeout=10).json()
-        db.reference(f"Users/{uid}/brokers/angelone/profile").set(profile)
+        try:
+            profile_resp = requests.get(SMARTAPI_PROFILE_URL, headers=prof_headers, timeout=10)
+            profile = profile_resp.json() if profile_resp.status_code == 200 else {"error": profile_resp.text}
+        except Exception as e:
+            profile = {"error": str(e)}
 
-        return jsonify({
-            "ok": True,
-            "message": "AngelOne SmartAPI verified & profile synced",
-            "profile": profile
-        }), 200
+        db.reference(f"Users/{uid}/brokers/angelone/profile").set(profile)
+        logger.info(f"✅ AngelOne linked for {client_code} (uid={uid})")
+        return jsonify({"ok": True, "message": "AngelOne SmartAPI verified & profile synced", "profile": profile}), 200
 
     except Exception as e:
         logger.exception("AngelOne login error")
@@ -210,6 +255,9 @@ def add_trading_account():
         data = request.get_json(force=True)
         uid = request.user["uid"]
         mode = data.get("mode", "real")
+
+        if mode not in ["paper", "real"]:
+            return jsonify({"ok": False, "error": "mode must be 'paper' or 'real'"}), 400
 
         if mode == "real":
             broker_name = data.get("broker_name")
@@ -236,6 +284,17 @@ def add_trading_account():
             }
 
         db.reference(f"Users/{uid}/brokerAccounts/{mode}").set(account_data)
+
+        # Also write non-sensitive meta to broker entry for quick checks
+        try:
+            db.reference(f"Users/{uid}/brokerAccounts_meta/{mode}").set({
+                "broker_name": account_data.get("broker_name"),
+                "last_updated": account_data.get("last_updated")
+            })
+        except Exception:
+            logger.warning("Failed to write brokerAccounts_meta (non-critical)")
+
+        logger.info(f"✅ Trading account ({mode}) added for {uid}")
         return jsonify({"ok": True, "message": f"{mode.capitalize()} trading account added successfully!"}), 200
     except Exception as e:
         logger.exception("Add trading account failed")
@@ -289,6 +348,7 @@ def broker_disconnect():
             return jsonify({"ok": False, "error": "broker required"}), 400
         uid = request.user["uid"]
         db.reference(f"Users/{uid}/brokers/{broker.lower()}").delete()
+        logger.info(f"⚠️ Broker {broker} disconnected for {uid}")
         return jsonify({"ok": True, "message": f"{broker} disconnected"}), 200
     except Exception as e:
         logger.exception("Broker disconnect failed")
@@ -307,6 +367,7 @@ def switch_mode():
             return jsonify({"ok": False, "error": "Invalid mode"}), 400
         uid = request.user["uid"]
         db.reference(f"Users/{uid}/mode").set(mode)
+        logger.info(f"Mode switched to {mode} for {uid}")
         return jsonify({"ok": True, "message": f"Mode switched to {mode}"}), 200
     except Exception as e:
         logger.exception("Switch mode failed")
